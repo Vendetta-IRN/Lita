@@ -1,0 +1,147 @@
+name: Build Lita
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      LITA_VERSION_CODE: ${{ github.run_number }}
+      LITA_VERSION_NAME: 1.0.${{ github.run_number }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Extract zip into repo and delete it
+        shell: bash
+        run: |
+          shopt -s nullglob
+          zips=(./*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "No zip found, building repo as is"
+            exit 0
+          fi
+
+          tmp="$RUNNER_TEMP/unz"
+          rm -rf "$tmp" && mkdir -p "$tmp"
+          for z in "${zips[@]}"; do unzip -o -q "$z" -d "$tmp"; done
+          rm -rf "$tmp/__MACOSX"
+
+          found=$(find "$tmp" -name settings.gradle.kts | head -n1)
+          if [ -z "$found" ]; then
+            echo "settings.gradle.kts not found inside zip"
+            exit 1
+          fi
+          src=$(dirname "$found")
+          rm -rf "$src/.github" "$src/.git"
+
+          cp -a "$src"/. .
+          git rm -q -f "${zips[@]}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Extract project from zip and remove zip"
+          if [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+            git push
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Set up Gradle 8.13
+        uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: 8.13
+
+      - name: Prepare signing key (optional)
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/lita.jks"
+            echo "LITA_KEYSTORE_FILE=$RUNNER_TEMP/lita.jks" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build and test (debug)
+        shell: bash
+        env:
+          LITA_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          LITA_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          LITA_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -o pipefail
+          gradle :app:testDebugUnitTest :app:assembleDebug --continue --console=plain -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g" -Pkotlin.compiler.execution.strategy=in-process -Pkotlin.daemon.jvmargs=-Xmx3g 2>&1 | tee build.log
+
+      - name: Build release (optimized, faster startup)
+        continue-on-error: true
+        shell: bash
+        env:
+          LITA_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          LITA_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          LITA_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -o pipefail
+          gradle :app:assembleRelease --console=plain -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g" -Pkotlin.compiler.execution.strategy=in-process -Pkotlin.daemon.jvmargs=-Xmx3g 2>&1 | tee release.log
+
+      - name: Show errors only
+        if: failure()
+        run: |
+          grep -E "^e: " build.log | head -80 || true
+          grep -E "FAILED|AssertionError" build.log | head -60 || true
+          grep -A6 "What went wrong" build.log | head -60 || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-logs
+          path: |
+            build.log
+            release.log
+          if-no-files-found: ignore
+
+      - name: Upload debug APK
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: Lita-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Upload release APK
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: Lita-release-apk
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: ignore
+
+      - name: Rename release APK
+        if: github.event_name != 'pull_request'
+        run: |
+          apk=$(ls app/build/outputs/apk/release/*.apk 2>/dev/null | head -n1)
+          if [ -n "$apk" ]; then cp "$apk" "Lita-v${LITA_VERSION_NAME}.apk"; fi
+          echo "HEAD_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Publish GitHub Release
+        if: github.event_name != 'pull_request' && hashFiles('Lita-v*.apk') != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.LITA_VERSION_NAME }}
+          target_commitish: ${{ env.HEAD_SHA }}
+          name: Lita v${{ env.LITA_VERSION_NAME }}
+          files: Lita-v*.apk
+          generate_release_notes: true
